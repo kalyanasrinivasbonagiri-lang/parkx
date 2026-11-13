@@ -1,11 +1,13 @@
 """FastAPI application entry point."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from threading import Event, Thread
 from typing import Any
 
 from fastapi import FastAPI
+from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.database import Database
 
@@ -20,6 +22,10 @@ from app.routers.bookings import router as bookings_router
 from app.routers.driver import router as driver_router
 from app.routers.reports import router as reports_router
 from app.routers.staff import router as staff_router
+
+
+# Read local CORS settings in development; deployed hosts provide the same variable.
+load_dotenv()
 
 
 @asynccontextmanager
@@ -51,9 +57,13 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Smart Parking Slot Booking System", lifespan=lifespan)
+cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://127.0.0.1:5173,http://localhost:5173",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=[origin.strip() for origin in cors_origins.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

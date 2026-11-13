@@ -118,7 +118,6 @@ def upsert_user(
     database: Database[dict[str, Any]],
     user: dict[str, Any],
     role: str,
-    assigned_lot_id: Any | None = None,
 ) -> Any:
     """Create a demo user once and retain any password changed after seeding."""
     user_doc: dict[str, Any] = {
@@ -130,9 +129,6 @@ def upsert_user(
     }
     if role == "driver":
         user_doc["vehicles"] = user.get("vehicles", [])
-    if assigned_lot_id is not None:
-        user_doc["assigned_lot_id"] = assigned_lot_id
-
     database.users.update_one(
         {"email": user_doc["email"]},
         {"$setOnInsert": user_doc},
@@ -254,18 +250,16 @@ def seed_demo_data(database: Database[dict[str, Any]]) -> None:
         "admin",
     )
 
-    # The context asks for two staff accounts, each assigned to one specific lot.
+    # Staff accounts can select their current work area after signing in.
     upsert_user(
         database,
         {"name": "Meena Staff", "email": "meena@parkx.demo", "phone": "9876500001"},
         "staff",
-        lot_ids[1],
     )
     upsert_user(
         database,
         {"name": "Arjun Staff", "email": "arjun@parkx.demo", "phone": "9876500002"},
         "staff",
-        lot_ids[2],
     )
 
     driver_ids = [upsert_user(database, driver, "driver") for driver in DRIVER_DATA]

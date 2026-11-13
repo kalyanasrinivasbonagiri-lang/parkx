@@ -58,6 +58,14 @@ def report_date_range(
     return start, end
 
 
+def report_range_fields(start: datetime, end: datetime) -> dict[str, str]:
+    """Expose the inclusive India-local dates represented by a UTC range."""
+    return {
+        "date_from": start.astimezone(INDIA_TIME).date().isoformat(),
+        "date_to": (end - timedelta(microseconds=1)).astimezone(INDIA_TIME).date().isoformat(),
+    }
+
+
 def slot_status(
     slot: dict[str, Any], reservations: list[dict[str, Any]]
 ) -> str:
@@ -333,7 +341,7 @@ def get_revenue_by_day(
         }
         for row in database.payments.aggregate(pipeline)
     ]
-    return {"rows": rows}
+    return {**report_range_fields(start, end), "rows": rows}
 
 
 @router.get("/reports/peak-hours")
@@ -368,7 +376,10 @@ def get_peak_hours(
             ]
         )
     )
-    return {"hours": [{"hour": row["_id"], "bookings": row["bookings"]} for row in rows]}
+    return {
+        **report_range_fields(start, end),
+        "hours": [{"hour": row["_id"], "bookings": row["bookings"]} for row in rows],
+    }
 
 
 @router.get("/reports/most-used-slots")
@@ -403,6 +414,7 @@ def get_most_used_slots(
         )
     )
     return {
+        **report_range_fields(start, end),
         "slots": [
             {
                 "slot_id": str(row["_id"]),
@@ -481,12 +493,21 @@ def get_scan_audit(
     }
     for key, item in summary.items():
         item["employee_name"] = employees.get(key, "Unknown employee")
+        item["invalid_scan_rate_percent"] = (
+            round(item["invalid_scans"] / item["total_scans"] * 100, 2)
+            if item["total_scans"]
+            else 0
+        )
 
     return {
+        **report_range_fields(start, end),
         "total_scans": total_scans,
         "invalid_scans": invalid_scans,
         "invalid_scan_rate_percent": round(invalid_scans / total_scans * 100, 2) if total_scans else 0,
-        "by_employee": list(summary.values()),
+        "by_employee": sorted(
+            summary.values(),
+            key=lambda item: (-item["total_scans"], item["employee_name"].lower()),
+        ),
         "logs": [
             {
                 "id": str(log["_id"]),
@@ -499,6 +520,169 @@ def get_scan_audit(
                 "scanned_at": log["scanned_at"].isoformat(),
             }
             for log in logs
+        ],
+    }
+
+
+@router.get("/reports/slot-performance")
+def get_slot_performance(
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    lot_id: str | None = Query(default=None),
+    database: Database[dict[str, Any]] = Depends(get_database),
+) -> dict[str, Any]:
+    """Return booking outcomes for every parking slot in the selected period."""
+    start, end = report_date_range(date_from, date_to)
+    lot_object_id = parse_lot_filter(lot_id)
+    slot_filter: dict[str, Any] = {}
+    booking_match: dict[str, Any] = {
+        "start_at": {"$gte": start, "$lt": end},
+        "status": {"$in": [*REPORT_BOOKING_STATUSES, "CANCELLED"]},
+    }
+    if lot_object_id is not None:
+        slot_filter["lot_id"] = lot_object_id
+        booking_match["lot_id"] = lot_object_id
+
+    # MongoDB groups historical bookings by their slot for per-space reporting.
+    booking_rows = list(
+        database.bookings.aggregate(
+            [
+                {"$match": booking_match},
+                {
+                    "$group": {
+                        "_id": "$slot_id",
+                        "booking_count": {"$sum": 1},
+                        "confirmed": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "CONFIRMED"]}, 1, 0]}
+                        },
+                        "checked_in": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "CHECKED_IN"]}, 1, 0]}
+                        },
+                        "completed": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "COMPLETED"]}, 1, 0]}
+                        },
+                        "overstays": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "OVERSTAY_DUE"]}, 1, 0]}
+                        },
+                        "no_shows": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "NO_SHOW"]}, 1, 0]}
+                        },
+                        "cancelled": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "CANCELLED"]}, 1, 0]}
+                        },
+                        "average_parking_minutes": {"$avg": "$parking_minutes"},
+                    }
+                },
+            ]
+        )
+    )
+    stats_by_slot = {row["_id"]: row for row in booking_rows}
+    slots = list(
+        database.slots.find(slot_filter).sort(
+            [("lot_id", ASCENDING), ("slot_number", ASCENDING)]
+        )
+    )
+    lot_ids = list({slot["lot_id"] for slot in slots})
+    lots = {
+        lot["_id"]: lot
+        for lot in database.lots.find({"_id": {"$in": lot_ids}})
+    } if lot_ids else {}
+
+    rows = []
+    for slot in slots:
+        stats = stats_by_slot.get(slot["_id"], {})
+        lot = lots.get(slot["lot_id"], {})
+        position = slot.get("grid_position", {})
+        average_minutes = stats.get("average_parking_minutes")
+        rows.append(
+            {
+                "lot_name": lot.get("name", "Unknown lot"),
+                "city": lot.get("city", ""),
+                "slot_number": slot["slot_number"],
+                "slot_type": slot.get("slot_type", "car"),
+                "floor": position.get("floor", 0),
+                "booking_count": stats.get("booking_count", 0),
+                "confirmed": stats.get("confirmed", 0),
+                "checked_in": stats.get("checked_in", 0),
+                "completed": stats.get("completed", 0),
+                "overstays": stats.get("overstays", 0),
+                "no_shows": stats.get("no_shows", 0),
+                "cancelled": stats.get("cancelled", 0),
+                "average_parking_minutes": round(average_minutes, 1)
+                if average_minutes is not None
+                else 0,
+            }
+        )
+    return {
+        "date_from": date_from.isoformat() if date_from else start.astimezone(INDIA_TIME).date().isoformat(),
+        "date_to": date_to.isoformat() if date_to else (end - timedelta(microseconds=1)).astimezone(INDIA_TIME).date().isoformat(),
+        "slots": rows,
+    }
+
+
+@router.get("/reports/daily-bookings")
+def get_daily_booking_activity(
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    lot_id: str | None = Query(default=None),
+    database: Database[dict[str, Any]] = Depends(get_database),
+) -> dict[str, Any]:
+    """Return daily booking totals and outcomes using India calendar days."""
+    start, end = report_date_range(date_from, date_to)
+    lot_object_id = parse_lot_filter(lot_id)
+    match: dict[str, Any] = {
+        "start_at": {"$gte": start, "$lt": end},
+        "status": {"$in": [*REPORT_BOOKING_STATUSES, "CANCELLED"]},
+    }
+    if lot_object_id is not None:
+        match["lot_id"] = lot_object_id
+
+    # MongoDB groups booking starts by the project's local calendar day.
+    rows = list(
+        database.bookings.aggregate(
+            [
+                {"$match": match},
+                {
+                    "$group": {
+                        "_id": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": "$start_at",
+                                "timezone": "Asia/Kolkata",
+                            }
+                        },
+                        "booking_count": {"$sum": 1},
+                        "completed": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "COMPLETED"]}, 1, 0]}
+                        },
+                        "overstays": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "OVERSTAY_DUE"]}, 1, 0]}
+                        },
+                        "no_shows": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "NO_SHOW"]}, 1, 0]}
+                        },
+                        "cancelled": {
+                            "$sum": {"$cond": [{"$eq": ["$status", "CANCELLED"]}, 1, 0]}
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    return {
+        "date_from": date_from.isoformat() if date_from else start.astimezone(INDIA_TIME).date().isoformat(),
+        "date_to": date_to.isoformat() if date_to else (end - timedelta(microseconds=1)).astimezone(INDIA_TIME).date().isoformat(),
+        "rows": [
+            {
+                "day": row["_id"],
+                "booking_count": row["booking_count"],
+                "completed": row["completed"],
+                "overstays": row["overstays"],
+                "no_shows": row["no_shows"],
+                "cancelled": row["cancelled"],
+            }
+            for row in rows
         ],
     }
 

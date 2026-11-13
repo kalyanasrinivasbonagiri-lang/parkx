@@ -119,10 +119,5 @@ def read_current_user(
     }
     if user["role"] == "driver":
         response["vehicles"] = user.get("vehicles", [])
-    if user["role"] == "staff":
-        assigned_lot_id = user.get("assigned_lot_id")
-        response["assigned_lot_id"] = (
-            str(assigned_lot_id) if assigned_lot_id is not None else None
-        )
     return response
 

@@ -1,5 +1,6 @@
 """Admin-only endpoints for parking lots, slots, and employees."""
 
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
 
 from bson import ObjectId
@@ -19,6 +20,8 @@ router = APIRouter(
     dependencies=[Depends(require_roles("admin"))],
 )
 
+INDIA_TIME = timezone(timedelta(hours=5, minutes=30), name="IST")
+
 
 class GeoPoint(BaseModel):
     """Map location using GeoJSON coordinate order: longitude, latitude."""
@@ -37,6 +40,15 @@ class LotCreate(BaseModel):
     hourly_rate: float = Field(gt=0)
     overstay_multiplier: float = Field(default=1.5, gt=0)
 
+    @field_validator("name", "city", "address")
+    @classmethod
+    def text_must_not_be_blank(cls, value: str) -> str:
+        """Reject whitespace-only lot details and normalize saved text."""
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank")
+        return value
+
 
 class SlotCreate(BaseModel):
     """One slot and its position in the visual grid."""
@@ -46,6 +58,15 @@ class SlotCreate(BaseModel):
     row: int = Field(ge=1)
     column: int = Field(ge=1)
     floor: int = Field(default=0, ge=0)
+
+    @field_validator("slot_number")
+    @classmethod
+    def slot_number_must_not_be_blank(cls, value: str) -> str:
+        """Trim labels and reject blank slot numbers before bulk insert."""
+        value = value.strip().upper()
+        if not value:
+            raise ValueError("Slot number cannot be blank")
+        return value
 
 
 class BulkSlotsCreate(BaseModel):
@@ -70,7 +91,15 @@ class EmployeeCreate(BaseModel):
     email: EmailStr
     phone: str = Field(min_length=7, max_length=20)
     password: str = Field(min_length=8, max_length=128)
-    lot_id: str
+
+    @field_validator("name", "phone")
+    @classmethod
+    def employee_text_must_not_be_blank(cls, value: str) -> str:
+        """Normalize employee text and reject whitespace-only values."""
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank")
+        return value
 
 
 def object_id_or_404(value: str, resource_name: str) -> ObjectId:
@@ -128,6 +157,112 @@ def list_lots(
     return {"lots": [serialize_lot(lot) for lot in lots]}
 
 
+@router.get("/lots/{lot_id}/details")
+def get_lot_details(
+    lot_id: str,
+    database: Database[dict[str, Any]] = Depends(get_database),
+) -> dict[str, Any]:
+    """Show the lot's current-hour counts and details for every parking slot."""
+    lot_object_id = object_id_or_404(lot_id, "Lot")
+    lot = database.lots.find_one({"_id": lot_object_id})
+    if lot is None:
+        raise HTTPException(status_code=404, detail="Lot not found")
+
+    now = datetime.now(UTC)
+    hour_start = datetime.now(INDIA_TIME).replace(
+        minute=0, second=0, microsecond=0
+    ).astimezone(UTC)
+    slots = list(database.slots.find({"lot_id": lot_object_id}))
+    slots.sort(
+        key=lambda item: (
+            item.get("grid_position", {}).get("floor", 0),
+            item.get("grid_position", {}).get("row", 0),
+            item.get("grid_position", {}).get("column", 0),
+            item.get("slot_number", ""),
+        )
+    )
+    slot_ids = [slot["_id"] for slot in slots]
+
+    # Read only active reservation rows for the current India-local hour bucket.
+    reservations = list(database.reservations.find(
+        {
+            "slot_id": {"$in": slot_ids},
+            "hourStart": hour_start,
+            "$or": [
+                {"status": {"$in": ["CONFIRMED", "CHECKED_IN"]}},
+                {"status": "PENDING_PAYMENT", "holdExpiresAt": {"$gt": now}},
+            ],
+        },
+        {"slot_id": 1, "booking_id": 1, "status": 1},
+    )) if slot_ids else []
+
+    reservations_by_slot: dict[ObjectId, list[dict[str, Any]]] = {}
+    for reservation in reservations:
+        reservations_by_slot.setdefault(reservation["slot_id"], []).append(reservation)
+    booking_ids = list({item["booking_id"] for item in reservations if item.get("booking_id")})
+    bookings = {
+        booking["_id"]: booking
+        for booking in database.bookings.find(
+            {"_id": {"$in": booking_ids}},
+            {"booking_code": 1, "vehicle_number": 1, "start_at": 1, "end_at": 1},
+        )
+    } if booking_ids else {}
+
+    slot_details = []
+    counts = {"FREE": 0, "HELD": 0, "BOOKED": 0, "OCCUPIED": 0, "BLOCKED": 0}
+    for slot in slots:
+        matching = reservations_by_slot.get(slot["_id"], [])
+        physical_state = slot.get("physical_state", "FREE")
+        if physical_state == "BLOCKED":
+            current_status = "BLOCKED"
+        elif physical_state == "OCCUPIED" or any(
+            item.get("status") == "CHECKED_IN" for item in matching
+        ):
+            current_status = "OCCUPIED"
+        elif any(item.get("status") == "PENDING_PAYMENT" for item in matching):
+            current_status = "HELD"
+        elif matching:
+            current_status = "BOOKED"
+        else:
+            current_status = "FREE"
+        counts[current_status] += 1
+
+        reservation = matching[0] if matching else None
+        booking = bookings.get(reservation.get("booking_id")) if reservation else None
+        position = slot.get("grid_position", {})
+        slot_details.append({
+            "id": str(slot["_id"]),
+            "slot_number": slot.get("slot_number", "—"),
+            "slot_type": slot.get("slot_type", "car"),
+            "physical_state": physical_state,
+            "status": current_status,
+            "floor": position.get("floor", 0),
+            "row": position.get("row"),
+            "column": position.get("column"),
+            "booking_code": booking.get("booking_code") if booking else None,
+            "vehicle_number": booking.get("vehicle_number") if booking else None,
+            "start_at": booking.get("start_at").isoformat() if booking and booking.get("start_at") else None,
+            "end_at": booking.get("end_at").isoformat() if booking and booking.get("end_at") else None,
+        })
+
+    return {
+        "lot_id": str(lot_object_id),
+        "name": lot["name"],
+        "city": lot["city"],
+        "address": lot["address"],
+        "hourly_rate": lot["hourly_rate"],
+        "overstay_multiplier": lot.get("overstay_multiplier", 1.5),
+        "hour_start": hour_start.isoformat(),
+        "total_slots": len(slots),
+        "free_slots": counts["FREE"],
+        "held_slots": counts["HELD"],
+        "booked_slots": counts["BOOKED"],
+        "occupied_slots": counts["OCCUPIED"],
+        "blocked_slots": counts["BLOCKED"],
+        "slots": slot_details,
+    }
+
+
 @router.post("/lots/{lot_id}/slots/bulk", status_code=status.HTTP_201_CREATED)
 def create_slots(
     lot_id: str,
@@ -181,18 +316,13 @@ def create_employee(
     request: EmployeeCreate,
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """Create a staff account assigned to exactly one lot."""
-    lot_object_id = object_id_or_404(request.lot_id, "Lot")
-    if database.lots.find_one({"_id": lot_object_id}) is None:
-        raise HTTPException(status_code=404, detail="Lot not found")
-
+    """Create staff access without a permanent parking-lot assignment."""
     employee = {
         "name": request.name.strip(),
         "email": str(request.email).strip().lower(),
         "phone": request.phone.strip(),
         "password_hash": hash_password(request.password),
         "role": "staff",
-        "assigned_lot_id": lot_object_id,
         "is_active": True,
     }
     try:
@@ -208,7 +338,6 @@ def create_employee(
         "name": employee["name"],
         "email": employee["email"],
         "role": employee["role"],
-        "assigned_lot_id": str(lot_object_id),
     }
 
 
@@ -216,11 +345,10 @@ def create_employee(
 def list_employees(
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """List staff accounts and their assigned lot for admin management."""
+    """List staff accounts for admin management."""
     employees = list(database.users.find({"role": "staff"}).sort("name", 1))
     response = []
     for employee in employees:
-        lot = database.lots.find_one({"_id": employee.get("assigned_lot_id")})
         response.append(
             {
                 "id": str(employee["_id"]),
@@ -228,11 +356,7 @@ def list_employees(
                 "email": employee["email"],
                 "phone": employee.get("phone"),
                 "is_active": employee.get("is_active", True),
-                "assigned_lot_id": str(employee["assigned_lot_id"])
-                if employee.get("assigned_lot_id")
-                else None,
-                "assigned_lot_name": lot.get("name") if lot else None,
-                "assigned_lot_city": lot.get("city") if lot else None,
+                "work_area": "Any lot",
             }
         )
     return {"employees": response}

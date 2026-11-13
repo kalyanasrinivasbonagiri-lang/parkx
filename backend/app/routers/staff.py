@@ -7,7 +7,7 @@ from typing import Any, Literal
 import jwt
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel, Field, model_validator
 from pymongo import ReturnDocument
@@ -43,21 +43,21 @@ class ScanRequest(BaseModel):
         return self
 
 
-def assigned_lot_id(employee: dict[str, Any]) -> ObjectId:
-    """Return the employee's assigned lot id or deny access if it is missing."""
-    lot_id = employee.get("assigned_lot_id")
-    if not isinstance(lot_id, ObjectId):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This employee is not assigned to a lot",
-        )
-    return lot_id
+def parse_staff_lot(lot_id: str, database: Database[dict[str, Any]]) -> ObjectId:
+    """Validate a lot selected by staff for area-specific views."""
+    try:
+        lot_object_id = ObjectId(lot_id)
+    except InvalidId as error:
+        raise HTTPException(status_code=404, detail="Lot not found") from error
+    if database.lots.find_one({"_id": lot_object_id}) is None:
+        raise HTTPException(status_code=404, detail="Lot not found")
+    return lot_object_id
 
 
 def log_scan(
     database: Database[dict[str, Any]],
     employee: dict[str, Any],
-    lot_id: ObjectId,
+    lot_id: ObjectId | None,
     action: str,
     result: str,
     booking_id: ObjectId | None = None,
@@ -91,7 +91,7 @@ def decode_scan_token(token: str) -> dict[str, Any]:
 def scan_result(
     database: Database[dict[str, Any]],
     employee: dict[str, Any],
-    assigned_lot: ObjectId,
+    scanned_lot: ObjectId | None,
     request: ScanRequest,
     result: str,
     booking: dict[str, Any] | None = None,
@@ -102,7 +102,7 @@ def scan_result(
     log_scan(
         database,
         employee,
-        assigned_lot,
+        scanned_lot,
         request.action,
         result,
         booking["_id"] if booking else scanned_booking_id,
@@ -157,35 +157,50 @@ def booking_details(
 
 @router.get("/bookings/today")
 def list_today_bookings(
+    lot_id: str = Query(),
     employee: dict[str, Any] = Depends(get_current_user),
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """List bookings starting today at the employee's assigned lot."""
-    lot_id = assigned_lot_id(employee)
+    """List today's bookings, optionally filtered to staff's selected work area."""
+    lot_object_id = parse_staff_lot(lot_id, database)
     today = datetime.now(INDIA_TIME).date()
     day_start = datetime.combine(today, time.min, tzinfo=INDIA_TIME).astimezone(UTC)
     day_end = datetime.combine(today + timedelta(days=1), time.min, tzinfo=INDIA_TIME).astimezone(UTC)
-    bookings = list(
-        database.bookings.find(
-            {"lot_id": lot_id, "start_at": {"$gte": day_start, "$lt": day_end}}
-        ).sort("start_at", 1)
-    )
+    booking_filter: dict[str, Any] = {"start_at": {"$gte": day_start, "$lt": day_end}}
+    booking_filter["lot_id"] = lot_object_id
+    bookings = list(database.bookings.find(booking_filter).sort("start_at", 1))
     return {
-        "lot_id": str(lot_id),
+        "lot_id": str(lot_object_id) if lot_object_id else None,
         "date": today.isoformat(),
         "bookings": [booking_details(database, booking) for booking in bookings],
     }
 
 
+@router.get("/lots")
+def list_staff_lots(
+    _: dict[str, Any] = Depends(get_current_user),
+    database: Database[dict[str, Any]] = Depends(get_database),
+) -> dict[str, Any]:
+    """List selectable work areas for staff without a permanent assignment."""
+    lots = list(database.lots.find({}).sort([("city", 1), ("name", 1)]))
+    return {
+        "lots": [
+            {"id": str(lot["_id"]), "name": lot["name"], "city": lot["city"]}
+            for lot in lots
+        ]
+    }
+
+
 @router.get("/slots")
-def list_assigned_lot_slots(
+def list_staff_lot_slots(
+    lot_id: str = Query(),
     employee: dict[str, Any] = Depends(get_current_user),
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """List physical slot states only for the employee's assigned lot."""
-    lot_id = assigned_lot_id(employee)
+    """List slot states for the area currently selected by staff."""
+    lot_object_id = parse_staff_lot(lot_id, database)
     slots = list(
-        database.slots.find({"lot_id": lot_id}).sort(
+        database.slots.find({"lot_id": lot_object_id}).sort(
             [("grid_position.floor", 1), ("grid_position.row", 1), ("grid_position.column", 1)]
         )
     )
@@ -249,15 +264,15 @@ def block_slot_for_maintenance(
     employee: dict[str, Any] = Depends(get_current_user),
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """Block a free slot at the employee's assigned lot for maintenance."""
-    lot_id = assigned_lot_id(employee)
+    """Block a free slot at the selected lot for maintenance."""
     try:
         slot_object_id = ObjectId(slot_id)
     except InvalidId as error:
         raise HTTPException(status_code=404, detail="Slot not found") from error
-    slot = database.slots.find_one({"_id": slot_object_id, "lot_id": lot_id})
+    slot = database.slots.find_one({"_id": slot_object_id})
     if slot is None:
-        raise HTTPException(status_code=404, detail="Slot not found at assigned lot")
+        raise HTTPException(status_code=404, detail="Slot not found")
+    lot_id = slot["lot_id"]
     if slot.get("physical_state") != "FREE":
         raise HTTPException(status_code=409, detail="Only a free slot can be blocked")
 
@@ -296,14 +311,13 @@ def unblock_slot(
     employee: dict[str, Any] = Depends(get_current_user),
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
-    """Return a blocked slot at the employee's assigned lot to service."""
-    lot_id = assigned_lot_id(employee)
+    """Return a blocked slot to service."""
     try:
         slot_object_id = ObjectId(slot_id)
     except InvalidId as error:
         raise HTTPException(status_code=404, detail="Slot not found") from error
     updated = database.slots.find_one_and_update(
-        {"_id": slot_object_id, "lot_id": lot_id, "physical_state": "BLOCKED"},
+        {"_id": slot_object_id, "physical_state": "BLOCKED"},
         {"$set": {"physical_state": "FREE"}},
         return_document=ReturnDocument.AFTER,
     )
@@ -319,7 +333,7 @@ def scan_booking(
     database: Database[dict[str, Any]] = Depends(get_database),
 ) -> dict[str, Any]:
     """Look up a booking or confirm entry/exit, logging every scan attempt."""
-    lot_id = assigned_lot_id(employee)
+    lot_id: ObjectId | None = None
     claims: dict[str, Any] | None = None
     if request.qr_token:
         try:
@@ -335,15 +349,7 @@ def scan_booking(
             token_lot_id = ObjectId(claims.get("lot_id", ""))
         except (InvalidId, TypeError):
             return scan_result(database, employee, lot_id, request, "INVALID_TOKEN")
-        if token_lot_id != lot_id:
-            return scan_result(
-                database,
-                employee,
-                lot_id,
-                request,
-                "WRONG_LOT",
-                scanned_booking_id=booking_id,
-            )
+        lot_id = token_lot_id
         booking = database.bookings.find_one({"_id": booking_id, "lot_id": lot_id})
         if booking is None or booking.get("qr_token") != request.qr_token:
             return scan_result(
@@ -367,10 +373,7 @@ def scan_booking(
                 booking_code=code,
             )
         booking_id = booking["_id"]
-        if booking["lot_id"] != lot_id:
-            return scan_result(
-                database, employee, lot_id, request, "WRONG_LOT", booking
-            )
+        lot_id = booking["lot_id"]
 
     now = datetime.now(UTC)
     start_at = booking["start_at"]
@@ -593,4 +596,3 @@ def scan_booking(
     return scan_result(
         database, employee, lot_id, request, result, exited_booking, details
     )
-

@@ -64,18 +64,6 @@ async def live_updates(websocket: WebSocket) -> None:
             await close_unauthorized(websocket, 4404, "Lot not found")
             return
 
-    if user["role"] == "staff":
-        assigned_lot = user.get("assigned_lot_id")
-        if not isinstance(assigned_lot, ObjectId):
-            await close_unauthorized(websocket, 4403, "Employee has no assigned lot")
-            return
-        if lot_id is not None and lot_id != assigned_lot:
-            await close_unauthorized(
-                websocket, 4403, "Employee cannot subscribe to this lot"
-            )
-            return
-        lot_id = assigned_lot
-
     await connection_manager.connect(
         websocket,
         user_id=str(user_object_id),

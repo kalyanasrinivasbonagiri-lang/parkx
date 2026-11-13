@@ -89,13 +89,27 @@ def list_my_bookings(
         .sort("created_at", -1)
         .limit(100)
     )
+    booking_ids = [booking["_id"] for booking in bookings]
+    lot_ids = list({booking["lot_id"] for booking in bookings})
+    slot_ids = list({booking["slot_id"] for booking in bookings})
+    # Fetch related records in batches to avoid three Atlas round trips per booking.
+    lots_by_id = {
+        lot["_id"]: lot for lot in database.lots.find({"_id": {"$in": lot_ids}})
+    } if lot_ids else {}
+    slots_by_id = {
+        slot["_id"]: slot for slot in database.slots.find({"_id": {"$in": slot_ids}})
+    } if slot_ids else {}
+    payments_by_booking: dict[ObjectId, list[dict[str, Any]]] = {}
+    for payment in database.payments.find(
+        {"booking_id": {"$in": booking_ids}}
+    ).sort("created_at", 1) if booking_ids else []:
+        payments_by_booking.setdefault(payment["booking_id"], []).append(payment)
+
     response = []
     for booking in bookings:
-        lot = database.lots.find_one({"_id": booking["lot_id"]}) or {}
-        slot = database.slots.find_one({"_id": booking["slot_id"]}) or {}
-        payments = list(
-            database.payments.find({"booking_id": booking["_id"]}).sort("created_at", 1)
-        )
+        lot = lots_by_id.get(booking["lot_id"], {})
+        slot = slots_by_id.get(booking["slot_id"], {})
+        payments = payments_by_booking.get(booking["_id"], [])
         response.append(
             {
                 "booking_id": str(booking["_id"]),

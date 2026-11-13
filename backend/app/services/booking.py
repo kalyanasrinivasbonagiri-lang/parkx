@@ -6,7 +6,7 @@ from typing import Any
 from bson import ObjectId
 from fastapi import HTTPException, status
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
 HOLD_MINUTES = 10
@@ -140,6 +140,15 @@ def create_booking_hold(
             status_code=status.HTTP_409_CONFLICT,
             detail="This slot was just taken for one or more selected hours",
         ) from error
+    except BulkWriteError as error:
+        # insert_many reports unique-index races as bulk write errors, not duplicate-key errors.
+        write_errors = (error.details or {}).get("writeErrors", [])
+        if any(item.get("code") == 11000 for item in write_errors):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This slot was just taken for one or more selected hours",
+            ) from error
+        raise
     except OperationFailure as error:
         if error.code == 112 or error.has_error_label("TransientTransactionError"):
             raise HTTPException(

@@ -80,6 +80,17 @@ Open the local URL Vite prints, usually <http://localhost:5173>. Keep both termi
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
+### Test on a phone over Wi-Fi
+
+Connect the phone and development computer to the same Wi-Fi network. Find the computer's IPv4 address with `ipconfig`, then:
+
+1. In `backend/.env`, set `CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://<computer-ip>:5173`.
+2. In `frontend/.env.local`, set `VITE_API_BASE_URL=http://<computer-ip>:8000`.
+3. Start FastAPI with `uv run uvicorn app.main:app --reload --host 0.0.0.0` from `backend` and Vite with `npm run dev` from `frontend`.
+4. Open `http://<computer-ip>:5173` on the phone. Allow local network access through Windows Firewall if prompted.
+
+Vite listens on the local network for this development workflow. The production build uses the configured API URL, or the same origin when deployed behind a reverse proxy.
+
 ## Demo data and accounts
 
 With the backend environment configured, run the seed script from the `backend` directory:
@@ -112,6 +123,10 @@ Only admins can create staff accounts in the application. Public sign-up creates
 3. Open **My bookings** and show the QR booking pass or booking code.
 4. Sign in as staff for the same lot and look up the booking or scan its QR. Confirm entry during the allowed entry window, then record exit.
 5. Sign in as admin to create lots and staff, inspect current occupancy, and view reports.
+
+## Deployment
+
+For production service settings, environment variables, CORS, WebSockets, and a pre-publish checklist, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Repository layout
 

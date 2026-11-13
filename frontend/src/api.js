@@ -1,4 +1,4 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? "http://127.0.0.1:8000" : window.location.origin);
 
 export async function request(path, options = {}) {
   let response;
@@ -46,11 +46,12 @@ export const payExtension = (bookingId, extensionId, method, action) => request(
 export const payOverstay = (id, method, action) => request(`/api/bookings/${id}/overstay-payment`, { method: "POST", body: JSON.stringify({ method, action }) });
 export const getReminders = () => request("/api/bookings/reminders");
 
-export const getStaffToday = () => request("/api/staff/bookings/today");
+export const getStaffToday = (lotId) => request(`/api/staff/bookings/today${lotId ? `?lot_id=${encodeURIComponent(lotId)}` : ""}`);
+export const getStaffLots = () => request("/api/staff/lots");
 export const scanBooking = (data) => request("/api/staff/scan", { method: "POST", body: JSON.stringify(data) });
 export const blockSlot = (id) => request(`/api/staff/slots/${id}/block`, { method: "POST" });
 export const unblockSlot = (id) => request(`/api/staff/slots/${id}/unblock`, { method: "POST" });
-export const getStaffSlots = () => request("/api/staff/slots");
+export const getStaffSlots = (lotId) => request(`/api/staff/slots?lot_id=${encodeURIComponent(lotId)}`);
 
 export const getAdminLots = () => request("/api/admin/lots");
 export const getEmployees = () => request("/api/admin/employees");
@@ -58,5 +59,13 @@ export const createLot = (data) => request("/api/admin/lots", { method: "POST", 
 export const createSlots = (lotId, slots) => request(`/api/admin/lots/${lotId}/slots/bulk`, { method: "POST", body: JSON.stringify({ slots }) });
 export const createEmployee = (data) => request("/api/admin/employees", { method: "POST", body: JSON.stringify(data) });
 export const getOccupancy = () => request("/api/admin/dashboard/occupancy");
-export const getReport = (name) => request(`/api/admin/reports/${name}`);
+export const getAdminLotDetails = (lotId) => request(`/api/admin/lots/${encodeURIComponent(lotId)}/details`);
+export const getReport = (name, filters = {}) => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) params.set("date_from", filters.dateFrom);
+  if (filters.dateTo) params.set("date_to", filters.dateTo);
+  if (filters.lotId) params.set("lot_id", filters.lotId);
+  const query = params.toString();
+  return request(`/api/admin/reports/${name}${query ? `?${query}` : ""}`);
+};
 export const API_WS_URL = API_BASE_URL.replace(/^http/, "ws") + "/ws/live";

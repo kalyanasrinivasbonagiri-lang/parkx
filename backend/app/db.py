@@ -115,7 +115,16 @@ def ensure_indexes(database: Database[dict[str, Any]]) -> None:
         [("lot_id", ASCENDING), ("start_at", ASCENDING)],
         name="bookings_by_lot_and_start",
     )
-    # Scan audit lookups are normally scoped by assigned lot or employee and time.
+    # Driver history is sorted by creation time, so this index avoids a large sort.
+    database.bookings.create_index(
+        [("driver_id", ASCENDING), ("created_at", DESCENDING)],
+        name="bookings_by_driver_and_created",
+    )
+    database.payments.create_index(
+        [("booking_id", ASCENDING), ("created_at", ASCENDING)],
+        name="payments_by_booking_and_created",
+    )
+    # Scan audit lookups are scoped by the employee's selected lot or by employee and time.
     database.scan_logs.create_index(
         [("lot_id", ASCENDING), ("scanned_at", DESCENDING)],
         name="scans_by_lot_and_time",
